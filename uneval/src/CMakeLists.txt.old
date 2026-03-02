@@ -1,0 +1,32 @@
+set(SOURCES
+  UnevaluatedAliasToLambdaCheck.cpp
+  UnevalModule.cpp
+)
+
+add_library(uneval MODULE ${SOURCES})
+
+target_include_directories(uneval
+  PRIVATE
+    ${CLANG_INCLUDE_DIRS}
+    ${LLVM_INCLUDE_DIRS}
+)
+
+# Link against the necessary Clang/LLVM libs for clang-tidy plugins
+target_link_libraries(uneval
+  PRIVATE
+    clangTidy
+    clangASTMatchers
+    clangAST
+    clangBasic
+    clangFrontend
+    clangRewrite
+    clangTooling
+    clangLex
+    LLVMCore
+)
+
+# Ensure no "lib" prefix on some platforms; clang-tidy expects a .so
+set_target_properties(uneval PROPERTIES
+  PREFIX ""
+  OUTPUT_NAME "uneval"
+)
