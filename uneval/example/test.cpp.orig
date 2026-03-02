@@ -1,0 +1,33 @@
+#include <iostream>
+
+template <typename T>
+using cpass = T;
+
+
+struct my_cpassable_monad
+{
+    int i;
+
+    template<typename F>
+    auto operator()(F&& f) const
+    {
+        if (!i) {
+            std::cout << "Warning: i == 0" << std::endl;
+            return decltype(std::forward<F>(f)(i)){0};
+        }
+        return std::forward<F>(f)(i);
+    }
+
+    operator int() const { return i; }  // not called normally
+};
+
+
+int f(int x, int y) { return x / y; }
+
+cpass<my_cpassable_monad> ret(int i) { return my_cpassable_monad{i}; }
+
+
+int main()
+{
+    std::cout << f(6, ret(2)) << ' ' << f(2, ret(0)) << std::endl;
+}

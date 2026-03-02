@@ -1,0 +1,290 @@
+#include "UnevaluatedAliasToLambdaCheck.h"
+
+#include "clang/AST/ASTContext.h"
+#include "clang/ASTMatchers/ASTMatchFinder.h"
+#include "clang/Lex/Lexer.h"
+
+using namespace clang;
+using namespace clang::ast_matchers;
+
+namespace clang {
+namespace tidy {
+namespace uneval {
+
+// --- Utilities --------------------------------------------------------------
+
+static std::string getText(const Stmt *S, const SourceManager &SM, const LangOptions &LO) {
+  CharSourceRange R = CharSourceRange::getTokenRange(S->getSourceRange());
+  return Lexer::getSourceText(R, SM, LO).str();
+}
+
+static std::string getText(const Expr *E, const SourceManager &SM, const LangOptions &LO) {
+  CharSourceRange R = CharSourceRange::getTokenRange(E->getSourceRange());
+  return Lexer::getSourceText(R, SM, LO).str();
+}
+
+// Check if a QualType is a specialization of alias template named AliasName (e.g., "cpass" / "unevaluated").
+static bool isAliasTemplateNamed(QualType QT, llvm::StringRef AliasName) {
+  if (QT.isNull()) return false;
+  if (const auto *TST = dyn_cast<TemplateSpecializationType>(QT.getTypePtr())) {
+    TemplateName TN = TST->getTemplateName();
+    if (const auto *TD = TN.getAsTemplateDecl()) {
+      if (const auto *Alias = dyn_cast<TypeAliasTemplateDecl>(TD))
+        return Alias->getName() == AliasName;
+    }
+  }
+  return false;
+}
+
+// Does this argument ultimately originate from a cpass<T> temporary, even through conversions?
+static bool isCpassArgument(const Expr *E) {
+  if (!E) return false;
+
+  // Strip parens and implicit casts
+  const Expr *Base = E->IgnoreParenImpCasts();
+
+  // Direct alias type
+  if (isAliasTemplateNamed(Base->getType(), "cpass"))
+    return true;
+
+  // Materialized temporary directly
+  if (const auto *MTE = dyn_cast<MaterializeTemporaryExpr>(Base))
+    return isAliasTemplateNamed(MTE->getType(), "cpass");
+
+  // Member call (e.g. operator int())
+  if (const auto *MCall = dyn_cast<CXXMemberCallExpr>(Base)) {
+    if (const Expr *Obj = MCall->getImplicitObjectArgument()) {
+      const Expr *ObjBase = Obj->IgnoreParenImpCasts();
+      if (isAliasTemplateNamed(ObjBase->getType(), "cpass"))
+        return true;
+      if (const auto *MTE = dyn_cast<MaterializeTemporaryExpr>(ObjBase))
+        return isAliasTemplateNamed(MTE->getType(), "cpass");
+    }
+  }
+
+  // MemberExpr base
+  if (const auto *ME = dyn_cast<MemberExpr>(Base)) {
+    if (const Expr *Obj = ME->getBase()->IgnoreParenImpCasts()) {
+      if (isAliasTemplateNamed(Obj->getType(), "cpass"))
+        return true;
+      if (const auto *MTE = dyn_cast<MaterializeTemporaryExpr>(Obj))
+        return isAliasTemplateNamed(MTE->getType(), "cpass");
+    }
+  }
+
+  // Fallback: scan children
+  for (const Stmt *Child : Base->children()) {
+    if (const auto *EChild = dyn_cast_or_null<Expr>(Child)) {
+      const Expr *C = EChild->IgnoreParenImpCasts();
+      if (isAliasTemplateNamed(C->getType(), "cpass"))
+        return true;
+      if (const auto *MTE = dyn_cast<MaterializeTemporaryExpr>(C))
+        return isAliasTemplateNamed(MTE->getType(), "cpass");
+    }
+  }
+
+  return false;
+}
+
+// --- Check ------------------------------------------------------------------
+
+UnevaluatedAliasToLambdaCheck::UnevaluatedAliasToLambdaCheck(llvm::StringRef Name,
+                                                             ClangTidyContext *Context)
+    : ClangTidyCheck(Name, Context) {}
+
+void UnevaluatedAliasToLambdaCheck::registerMatchers(MatchFinder *Finder) {
+  // unevaluated<T> parameter declarations (written form)
+  auto UnevaluatedParam =
+      parmVarDecl(hasType(templateSpecializationType(
+                      hasDeclaration(typeAliasTemplateDecl(hasName("unevaluated"))))))
+          .bind("parm");
+
+  // Decls: rewrite parameter type unevaluated<T> -> auto
+  Finder->addMatcher(functionDecl(forEachDescendant(UnevaluatedParam)).bind("fdecl"), this);
+
+  // Calls: wrap arguments for unevaluated<T> parameters into lazy lambdas
+  Finder->addMatcher(
+      callExpr(
+          forEachArgumentWithParam(
+              ignoringParenImpCasts(expr().bind("arg")),
+              UnevaluatedParam),
+          callee(functionDecl()))
+          .bind("call"),
+      this);
+
+  // Body: uses of unevaluated<T> params become x()
+  Finder->addMatcher(
+      declRefExpr(
+          to(UnevaluatedParam),
+          hasAncestor(functionDecl().bind("body-fdecl")))
+          .bind("ref"),
+      this);
+
+  // cpass<T>: robustly detect any call with at least one argument whose subtree contains
+  // a materialized temporary of alias type cpass<...>.
+  Finder->addMatcher(
+      callExpr(
+          hasAnyArgument(
+              expr(
+                  anyOf(
+                      hasType(templateSpecializationType(
+                          hasDeclaration(typeAliasTemplateDecl(hasName("cpass")))
+                      )),
+                      hasDescendant(materializeTemporaryExpr(
+                          hasType(templateSpecializationType(
+                              hasDeclaration(typeAliasTemplateDecl(hasName("cpass")))))
+                      ))
+                  )
+              ).bind("cpass-arg")
+          )
+      ).bind("cpass-call"),
+      this);
+}
+
+void UnevaluatedAliasToLambdaCheck::check(const MatchFinder::MatchResult &Result) {
+  const auto *Parm       = Result.Nodes.getNodeAs<ParmVarDecl>("parm");
+  const auto *FDecl      = Result.Nodes.getNodeAs<FunctionDecl>("fdecl");
+  const auto *Arg        = Result.Nodes.getNodeAs<Expr>("arg");
+  const auto *Call       = Result.Nodes.getNodeAs<CallExpr>("call");
+  const auto *Ref        = Result.Nodes.getNodeAs<DeclRefExpr>("ref");
+  const auto *BodyFDecl  = Result.Nodes.getNodeAs<FunctionDecl>("body-fdecl");
+  const auto *CpassCall  = Result.Nodes.getNodeAs<CallExpr>("cpass-call");
+
+  auto &Ctx = *Result.Context;
+  auto &SM  = *Result.SourceManager;
+  const auto &LO = Ctx.getLangOpts();
+
+  // 1) unevaluated<T> declaration parameter type rewrite
+  if (FDecl && Parm) {
+    if (const TypeSourceInfo *TSI = Parm->getTypeSourceInfo()) {
+      TypeLoc TL = TSI->getTypeLoc();
+      SourceRange TypeSR = TL.getSourceRange();
+
+      std::string AutoText = "auto";
+      QualType QT = Parm->getType();
+
+      if (QT.isConstQualified())     AutoText = "const " + AutoText;
+      if (QT.isVolatileQualified())  AutoText = "volatile " + AutoText;
+
+      if (QT->isLValueReferenceType())
+        AutoText += " &";
+      else if (QT->isRValueReferenceType())
+        AutoText += " &&";
+
+      diag(Parm->getLocation(),
+           "replace parameter type unevaluated<T> with %0")
+          << AutoText
+          << FixItHint::CreateReplacement(CharSourceRange::getTokenRange(TypeSR), AutoText);
+    }
+  }
+
+  // 2) unevaluated<T> call-site argument -> lazy lambda
+  if (Call && Arg && Parm) {
+    if (Arg->getBeginLoc().isMacroID())
+      return;
+
+    std::string ArgText = getText(Arg, SM, LO);
+    std::string Replacement = "[&]{ return (" + ArgText + "); }";
+
+    diag(Arg->getBeginLoc(), "wrap unevaluated<T> argument in lazy lambda")
+        << FixItHint::CreateReplacement(Arg->getSourceRange(), Replacement);
+  }
+
+  // 3) unevaluated<T> body uses: x -> x()
+  if (BodyFDecl && Ref && Parm) {
+    if (Ref->getBeginLoc().isMacroID())
+      return;
+
+    // Avoid double-applying to already-called x()
+    const auto &Parents = Result.Context->getParents(*Ref);
+    if (!Parents.empty()) {
+      if (const auto *CE = Parents[0].get<CallExpr>()) {
+        if (CE->getCallee() == Ref)
+          return;
+      }
+      if (Parents[0].get<MemberExpr>())
+        return; // skip x.member
+    }
+
+    CharSourceRange RefRange = CharSourceRange::getTokenRange(Ref->getSourceRange());
+    std::string Replacement = Ref->getNameInfo().getAsString() + "()";
+
+    diag(Ref->getBeginLoc(), "replace use of unevaluated<T> parameter with call to lambda")
+        << FixItHint::CreateReplacement(RefRange, Replacement);
+  }
+
+  // 4) cpass<T> call rewrite:
+  //    For each argument position that is cpass<T>, rewrite:
+  //      f(a1, a2, c, a4) ->
+  //      c([&](auto&& cval){ return f(a1, a2, std::forward<decltype(cval)>(cval), a4); })
+  //
+  //    If multiple cpass args exist, apply step-by-step wrapping (left-to-right).
+  if (CpassCall) {
+
+    if (CpassCall->getBeginLoc().isMacroID())
+      return;
+
+    const Expr *CalleeExpr = CpassCall->getCallee();
+    std::string CalleeText = getText(CalleeExpr, SM, LO);
+
+    // Gather original argument texts and detect cpass<T> with robust inspection.
+    std::vector<std::string> ArgTexts;
+    std::vector<bool> IsCpass;
+    ArgTexts.reserve(CpassCall->getNumArgs());
+    IsCpass.reserve(CpassCall->getNumArgs());
+
+    for (unsigned i = 0; i < CpassCall->getNumArgs(); ++i) {
+      const Expr *E = CpassCall->getArg(i);
+      ArgTexts.push_back(getText(E, SM, LO));
+      IsCpass.push_back(isCpassArgument(E));
+
+      diag(E->getBeginLoc(),
+           "arg %0 text='%1' type='%2' isCpass=%3")
+        << i << getText(E, SM, LO) << E->getType().getAsString() << isCpassArgument(E);
+    }
+
+    diag(CpassCall->getBeginLoc(),
+         ("cpass<T> rewrite: callee='" + CalleeText + "', args=" +
+          llvm::join(ArgTexts, ", ")).c_str());
+
+    if (std::none_of(IsCpass.begin(), IsCpass.end(), [](bool b){ return b; }))
+      return;
+
+    diag(CpassCall->getBeginLoc(), "there are args");
+
+    auto buildInnerCall = [&](const std::vector<std::string> &Args) -> std::string {
+      std::string S = CalleeText + "(";
+      for (unsigned i = 0; i < Args.size(); ++i) {
+        if (i) S += ", ";
+        S += Args[i];
+      }
+      S += ")";
+      return S;
+    };
+
+    std::string Current = buildInnerCall(ArgTexts);
+
+    // Wrap step-by-step for each cpass<T> argument, left-to-right.
+    for (unsigned i = 0; i < ArgTexts.size(); ++i) {
+      if (!IsCpass[i])
+        continue;
+
+      std::vector<std::string> NewArgs = ArgTexts;
+      NewArgs[i] = "std::forward<decltype(cval)>(cval)";
+
+      std::string InnerCall = buildInnerCall(NewArgs);
+      std::string Wrapped =
+          ArgTexts[i] + "([&](auto&& cval){ return " + InnerCall + "; })";
+
+      Current = Wrapped;
+    }
+
+    CharSourceRange CallRange = CharSourceRange::getTokenRange(CpassCall->getSourceRange());
+    diag(CpassCall->getBeginLoc(), "rewrite cpass<T> call into callback wrapping")
+        << FixItHint::CreateReplacement(CallRange, Current);
+  }
+}
+
+} // namespace uneval
+} // namespace tidy
+} // namespace clang

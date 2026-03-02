@@ -1,0 +1,47 @@
+#include <iostream>
+#include <type_traits>
+
+template <typename T>
+using cpass = T;
+
+
+struct my_cpassable_monad
+{
+    int i;
+
+    friend std::ostream& operator<<(std::ostream& os, my_cpassable_monad const& m) { os << m.i; return os; }
+
+    template<typename F>
+    auto operator()(F&& f) const
+    -> cpass<std::enable_if_t<std::is_same_v<int, std::invoke_result_t<F, int>>, my_cpassable_monad>>
+    {
+        if (!i) {
+            std::cout << "Warning: i == 0" << std::endl;
+            return {decltype(std::forward<F>(f)(i)){0}};
+        }
+        return {std::forward<F>(f)(i)};
+    }
+
+    template<typename F>
+    auto operator()(F&& f) const
+    -> std::enable_if_t<!std::is_same_v<int, std::invoke_result_t<F, int>>, std::invoke_result_t<F, int>>
+    {
+        if (!i) {
+            return std::forward<F>(f)("0 or INF");
+        }
+        return std::forward<F>(f)(i);
+    }
+
+    operator int() const { return i; }  // not called normally
+
+    static cpass<my_cpassable_monad> ret(int i) { return my_cpassable_monad{i}; }
+};
+
+
+int f(int x, int y) { return x / y; }
+
+
+int main()
+{
+    std::cout << f(1, f(2, my_cpassable_monad::ret(0))) << " * " << std::endl;
+}
