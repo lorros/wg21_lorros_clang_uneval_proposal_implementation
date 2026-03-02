@@ -1,0 +1,29 @@
+cmake_minimum_required(VERSION 3.15)
+project(uneval_clang_tidy_plugin LANGUAGES C CXX)
+
+# Find LLVM and Clang 14
+# find_package(LLVM 14 REQUIRED CONFIG)
+# find_package(Clang REQUIRED CONFIG)
+#####
+# Explicitly set include and lib paths for system clang/llvm
+include_directories(/usr/include/clang /usr/include/llvm)
+link_directories(/lib/x86_64-linux-gnu)
+
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
+message(STATUS "Using ClangConfig.cmake in: ${Clang_DIR}")
+
+# LLVM setup
+include_directories(${LLVM_INCLUDE_DIRS})
+add_definitions(${LLVM_DEFINITIONS})
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Clang/LLVM are built with -fno-rtti in some distributions; plugins need to match
+if (LLVM_ENABLE_RTTI)
+  add_definitions(-DLLVM_ENABLE_RTTI=1)
+else()
+  add_definitions(-DLLVM_ENABLE_RTTI=0)
+endif()
+
+add_subdirectory(src)
