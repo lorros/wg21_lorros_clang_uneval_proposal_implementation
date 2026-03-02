@@ -1,0 +1,10 @@
+// test.cpp
+template <typename T>
+using unevaluated = T;
+
+int f(unevaluated<int> x, int y) { return x + y; }
+
+int g() {
+  int a = 40;
+  return f(a + 2, 1);
+}
